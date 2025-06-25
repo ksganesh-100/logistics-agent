@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Logistics Flow Manager</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Inter Font -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: #f3f4f6; /* Light gray background */
+        }
+        /* Custom scrollbar for better aesthetics */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #f1f1f1;
+            border-radius: 10px;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #888;
+            border-radius: 10px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #555;
+        }
+    </style>
+</head>
+<body class="min-h-screen flex flex-col">
+
+    <!-- Firebase SDKs - Type="module" is essential for modern Firebase usage -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, query, orderBy, onSnapshot, doc, getDoc, Timestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Global variables for Firebase instances and app ID
+        let db;
+        let auth;
+        let APP_ID;
+        let userId = 'N/A';
+        let isAuthReady = false;
+
+        // Function to safely get a value from an object path
+        const getNestedValue = (obj, path, defaultValue = 'N/A') => {
+            return path.split('.').reduce((acc, part) => acc && acc[part] !== undefined ? acc[part] : undefined, obj) || defaultValue;
+        };
+
+        // Helper function to format timestamp
+        const formatTimestamp = (ts) => {
+            return ts instanceof Timestamp ? ts.toDate().toLocaleString() : 'N/A';
+        };
+
+        // Helper function to format date
+        const formatDate = (ts) => {
+            return ts instanceof Timestamp ? ts.toDate().toLocaleDateString() : 'N/A';
+        };
+
+        // Utility to escape HTML for safe display
+        const escapeHTML = (str) => {
+            const div = document.createElement('div');
+            div.appendChild(document.createTextNode(str));
+            return div.innerHTML;
+        };
+
+        // --- Firebase Initialization and Authentication ---
+        const initializeFirebase = async () => {
+            try {
+                // Parse Firebase config from global variable, with a fallback for local testing
+                const firebaseConfig = typeof __firebase_config !== 'undefined'
+                    ? JSON.parse(__firebase_config)
+                    : {
+                        apiKey: "YOUR_API_KEY", // Replace with your actual Firebase API Key for local testing
+                        authDomain: "YOUR_AUTH_DOMAIN",
+                        projectId: "YOUR_PROJECT_ID",
+                        storageBucket: "YOUR_STORAGE_BUCKET",
+                        messagingSenderId: "YOUR_MESSAGING_SENDER_ID",
+                        appId: "YOUR_APP_ID"
+                    };
+
+                // Define APP_ID using the global variable, with a fallback
+                APP_ID = typeof __app_id !== 'undefined' ? __app_id : 'default-logistics-app';
+
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                // Listen for auth state changes to get user ID
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        document.getElementById('user-id-display').textContent = userId;
+                        console.log("Firebase Auth State Changed: User is signed in with UID:", userId);
+                    } else {
+                        // If no user signed in, try custom token or anonymous auth
+                        try {
+                            if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                                await signInWithCustomToken(auth, __initial_auth_token);
+                                console.log("Signed in with custom token from __initial_auth_token.");
+                            } else {
+                                await signInAnonymously(auth);
+                                console.log("Signed in anonymously as no initial auth token provided.");
+                            }
+                            userId = auth.currentUser?.uid || crypto.randomUUID(); // Fallback if anonymous doesn't give UID immediately
+                            document.getElementById('user-id-display').textContent = userId;
+                        } catch (error) {
+                            console.error("Firebase authentication failed:", error);
+                            document.getElementById('app-status').innerHTML = `<p class="text-red-700">Authentication failed: ${escapeHTML(error.message)}. Please check your Firebase configuration and security rules.</p>`;
+                        }
+                    }
+                    isAuthReady = true;
+                    // Once authenticated, start listening for data
+                    if (document.getElementById('app-status')) {
+                         document.getElementById('app-status').style.display = 'none'; // Hide loading message
+                    }
+                    renderDashboard(); // Initial render after auth is ready
+                });
+
+            } catch (error) {
+                console.error("Firebase initialization failed:", error);
+                document.getElementById('app-status').innerHTML = `<p class="text-red-700">Firebase initialization error: ${escapeHTML(error.message)}. Please ensure __firebase_config is valid and SDKs are loaded correctly.</p>`;
+            }
+        };
+
+        // --- Router Logic (Hash-based) ---
+        const navigateTo = (path) => {
+            window.location.hash = path;
+        };
+
+        const renderView = () => {
+            const hash = window.location.hash;
+            const dashboardView = document.getElementById('dashboard-view');
+            const detailView = document.getElementById('detail-view');
+
+            // Hide both initially
+            dashboardView.classList.add('hidden');
+            detailView.classList.add('hidden');
+
+            if (hash.startsWith('#call-off/')) {
+                const callOffId = hash.substring('#call-off/'.length);
+                renderCallOffDetail(callOffId);
+                detailView.classList.remove('hidden');
+            } else {
+                renderDashboard();
+                dashboardView.classList.remove('hidden');
+            }
+        };
+
+        window.addEventListener('hashchange', renderView);
+        window.addEventListener('DOMContentLoaded', initializeFirebase); // Initialize Firebase on DOM content loaded
+
+        // --- Dashboard View Rendering ---
+        const renderDashboard = () => {
+            if (!isAuthReady || !db) {
+                // If not ready, a loading message will be shown by initializeFirebase
+                return;
+            }
+
+            const callOffsListContainer = document.getElementById('call-offs-list');
+            callOffsListContainer.innerHTML = `
+                <div class="text-center p-8 text-gray-600">Loading call-offs...</div>
+            `; // Show loading state
+
+            const q = query(
+                collection(db, `artifacts/${APP_ID}/public/data/callOffs`),
+                orderBy("createdAt", "desc")
+            );
+
+            onSnapshot(
+                q,
+                (snapshot) => {
+                    const callOffsData = snapshot.docs.map((doc) => ({
+                        id: doc.id,
+                        ...doc.data(),
+                    }));
+
+                    if (callOffsData.length === 0) {
+                        callOffsListContainer.innerHTML = `
+                            <p class="text-gray-600 text-lg text-center p-8">No call-off requests found. Waiting for new email intakes to appear here.</p>
+                        `;
+                        return;
+                    }
+
+                    let tableHtml = `
+                        <div class="overflow-x-auto">
+                            <table class="min-w-full bg-white border border-gray-200 rounded-lg overflow-hidden">
+                                <thead class="bg-gradient-to-r from-blue-600 to-purple-600 text-white shadow-md">
+                                    <tr>
+                                        <th class="py-3 px-6 text-left text-sm font-semibold uppercase tracking-wider">Call-Off ID</th>
+                                        <th class="py-3 px-6 text-left text-sm font-semibold uppercase tracking-wider">Contract No.</th>
+                                        <th class="py-3 px-6 text-left text-sm font-semibold uppercase tracking-wider">Delivery Location</th>
+                                        <th class="py-3 px-6 text-left text-sm font-semibold uppercase tracking-wider">Expected Date</th>
+                                        <th class="py-3 px-6 text-left text-sm font-semibold uppercase tracking-wider">Status</th>
+                                        <th class="py-3 px-6 text-left text-sm font-semibold uppercase tracking-wider">Last Updated</th>
+                                        <th class="py-3 px-6 text-left text-sm font-semibold uppercase tracking-wider">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="text-gray-700 text-sm font-light divide-y divide-gray-200">
+                    `;
+
+                    callOffsData.forEach((callOff) => {
+                        const statusClass = (() => {
+                            switch (callOff.currentStatus) {
+                                case 'Completed': return 'bg-green-100 text-green-700 border border-green-300';
+                                case 'Exception': return 'bg-red-100 text-red-700 border border-red-300';
+                                case 'In-Transit': return 'bg-blue-100 text-blue-700 border border-blue-300';
+                                case 'Draft': return 'bg-yellow-100 text-yellow-700 border border-yellow-300';
+                                case 'Validated': return 'bg-purple-100 text-purple-700 border border-purple-300';
+                                case 'Assigned': return 'bg-indigo-100 text-indigo-700 border border-indigo-300';
+                                default: return 'bg-gray-100 text-gray-700 border border-gray-300';
+                            }
+                        })();
+
+                        tableHtml += `
+                            <tr class="hover:bg-blue-50 transition-colors duration-150">
+                                <td class="py-4 px-6 text-left whitespace-nowrap font-medium">${escapeHTML(callOff.id || 'N/A')}</td>
+                                <td class="py-4 px-6 text-left">${escapeHTML(callOff.contractNumber || 'N/A')}</td>
+                                <td class="py-4 px-6 text-left">${escapeHTML(callOff.deliveryLocation || 'N/A')}</td>
+                                <td class="py-4 px-6 text-left">${formatDate(callOff.expectedDate)}</td>
+                                <td class="py-4 px-6 text-left">
+                                    <span class="py-1 px-3 rounded-full text-xs font-bold shadow-sm ${statusClass}">
+                                        ${escapeHTML(callOff.currentStatus || 'Unknown')}
+                                    </span>
+                                </td>
+                                <td class="py-4 px-6 text-left">${formatTimestamp(callOff.updatedAt)}</td>
+                                <td class="py-4 px-6 text-left">
+                                    <a href="#call-off/${escapeHTML(callOff.id)}" class="text-blue-600 hover:text-blue-800 font-semibold transition-colors duration-200">
+                                        View Details
+                                    </a>
+                                </td>
+                            </tr>
+                        `;
+                    });
+
+                    tableHtml += `
+                                </tbody>
+                            </table>
+                        </div>
+                    `;
+                    callOffsListContainer.innerHTML = tableHtml;
+                },
+                (err) => {
+                    console.error("Error fetching call-offs:", err);
+                    callOffsListContainer.innerHTML = `<p class="text-center p-8 text-red-600">Failed to load call-offs. Please try again.</p>`;
+                }
+            );
+        };
+
+
+        // --- Detail View Rendering ---
+        const renderCallOffDetail = async (callOffId) => {
+            if (!isAuthReady || !db) {
+                // If not ready, a loading message will be shown by initializeFirebase
+                return;
+            }
+
+            const detailContentDiv = document.getElementById('detail-content');
+            detailContentDiv.innerHTML = `<div class="text-center p-8 text-gray-600">Loading call-off details for ${escapeHTML(callOffId)}...</div>`;
+
+            try {
+                const docRef = doc(db, `artifacts/${APP_ID}/public/data/callOffs`, callOffId);
+                const docSnap = await getDoc(docRef);
+
+                if (docSnap.exists()) {
+                    const callOff = { id: docSnap.id, ...docSnap.data() };
+                    let detailHtml = `
+                        <div class="flex justify-between items-center mb-6">
+                            <h2 class="text-4xl font-extrabold text-gray-900">Call-Off Details: ${escapeHTML(callOff.id)}</h2>
+                            <button onclick="navigateTo('')" class="px-6 py-3 bg-blue-600 text-white font-semibold rounded-lg shadow-md hover:bg-blue-700 transition-transform duration-200 transform hover:scale-105">
+                                Back to Dashboard
+                            </button>
+                        </div>
+                        <div class="space-y-6">
+                    `;
+
+                    const sectionClass = "bg-white p-6 rounded-xl shadow-lg border border-gray-200 mb-6";
+                    const sectionTitleClass = "text-2xl font-bold text-gray-800 mb-4 pb-2 border-b border-blue-200";
+                    const dataItemClass = "mb-2 text-gray-700";
+
+                    const highlightSpanClass = (status) => {
+                        switch (status) {
+                            case 'Valid': return 'bg-green-100 text-green-700';
+                            case 'Invalid':
+                            case 'Quota Insufficient':
+                            case 'Contract Expired':
+                            case 'Escalated': return 'bg-red-100 text-red-700';
+                            default: return 'bg-gray-100 text-gray-700';
+                        }
+                    };
+
+                    // General Information (Email Intake Agent)
+                    detailHtml += `
+                        <div class="${sectionClass}">
+                            <h3 class="${sectionTitleClass}">Email Intake & General Information</h3>
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <p class="${dataItemClass}"><strong>Contract No:</strong> ${escapeHTML(getNestedValue(callOff, 'contractNumber'))}</p>
+                                <p class="${dataItemClass}"><strong>Requested Volume:</strong> ${escapeHTML(getNestedValue(callOff, 'requestedVolume'))}</p>
+                                <p class="${dataItemClass}"><strong>Delivery Location:</strong> ${escapeHTML(getNestedValue(callOff, 'deliveryLocation'))}</p>
+                                <p class="${dataItemClass}"><strong>Expected Date:</strong> ${formatDate(getNestedValue(callOff, 'expectedDate'))}</p>
+                                <p class="${dataItemClass}"><strong>Customer Email:</strong> ${escapeHTML(getNestedValue(callOff, 'customerEmail'))}</p>
+                                <p class="${dataItemClass}"><strong>Initial Request Date:</strong> ${formatTimestamp(getNestedValue(callOff, 'createdAt'))}</p>
+                                <p class="${dataItemClass}"><strong>Current Status:</strong> <span class="py-1 px-3 rounded-full text-sm font-bold shadow-sm ${highlightSpanClass(callOff.currentStatus)}">
+                                    ${escapeHTML(callOff.currentStatus || 'Unknown')}
+                                </span></p>
+                                <p class="${dataItemClass}"><strong>Last Updated:</strong> ${formatTimestamp(getNestedValue(callOff, 'updatedAt'))}</p>
+                            </div>
+                            ${callOff.emailIntakeDetails ? `
+                                <div class="mt-4 p-3 bg-gray-50 rounded-md text-sm text-gray-600 border border-gray-200">
+                                    <p><strong>Raw Subject:</strong> ${escapeHTML(getNestedValue(callOff, 'emailIntakeDetails.rawEmailSubject'))}</p>
+                                    <p><strong>Raw Body Snippet:</strong> ${escapeHTML(getNestedValue(callOff, 'emailIntakeDetails.rawEmailBody')).substring(0, 150) + '...'}</p>
+                                </div>
+                            ` : ''}
+                        </div>
+                    `;
+
+                    // Contract Validator Agent
+                    if (callOff.validation) {
+                        detailHtml += `
+                            <div class="${sectionClass}">
+                                <h3 class="${sectionTitleClass}">Contract Validation <span class="ml-2 px-3 py-1 rounded-full text-sm font-semibold ${highlightSpanClass(callOff.validation.status)}">
+                                    ${escapeHTML(callOff.validation.status || 'N/A')}
+                                </span></h3>
+                                <p class="${dataItemClass}"><strong>Reason:</strong> ${escapeHTML(callOff.validation.reason || 'N/A')}</p>
+                                <p class="${dataItemClass}"><strong>Escalated to Human:</strong> ${callOff.validation.escalatedToManual ? 'Yes' : 'No'}</p>
+                            </div>
+                        `;
+                    }
+
+                    // Assignment Finder Agent
+                    if (callOff.assignment) {
+                        detailHtml += `
+                            <div class="${sectionClass}">
+                                <h3 class="${sectionTitleClass}">Inventory Assignment</h3>
+                                <p class="${dataItemClass}"><strong>Matched Source:</strong> ${escapeHTML(getNestedValue(callOff, 'assignment.matchedInventorySource'))}</p>
+                                <p class="${dataItemClass}"><strong>Assigned Quantity:</strong> ${escapeHTML(getNestedValue(callOff, 'assignment.assignedQuantity'))}</p>
+                                <p class="${dataItemClass}"><strong>Location Proximity:</strong> ${escapeHTML(getNestedValue(callOff, 'assignment.locationProximityScore'))}</p>
+                                <p class="${dataItemClass}"><strong>Availability Date:</strong> ${formatDate(getNestedValue(callOff, 'assignment.availabilityDate'))}</p>
+                                ${getNestedValue(callOff, 'assignment.blendedSources', []).length > 0 ? `
+                                    <p class="${dataItemClass}"><strong>Blended Sources:</strong> ${escapeHTML(callOff.assignment.blendedSources.join(', '))}</p>
+                                ` : ''}
+                            </div>
+                        `;
+                    }
+
+                    // Ops Routing Agent
+                    if (callOff.operations) {
+                        detailHtml += `
+                            <div class="${sectionClass}">
+                                <h3 class="${sectionTitleClass}">Operations Routing</h3>
+                                <p class="${dataItemClass}"><strong>Notified At:</strong> ${formatTimestamp(getNestedValue(callOff, 'operations.notifiedAt'))}</p>
+                                <p class="${dataItemClass}"><strong>Tentative Plans:</strong> ${escapeHTML(getNestedValue(callOff, 'operations.tentativePlans'))}</p>
+                                <p class="${dataItemClass}"><strong>Approval Required:</strong> ${getNestedValue(callOff, 'operations.approvalRequired') ? 'Yes' : 'No'}</p>
+                                ${getNestedValue(callOff, 'operations.approvedAt') ? `<p class="${dataItemClass}"><strong>Approved At:</strong> ${formatTimestamp(getNestedValue(callOff, 'operations.approvedAt'))}</p>` : ''}
+                            </div>
+                        `;
+                    }
+
+                    // Status Tracker Agent
+                    if (callOff.statusLog && callOff.statusLog.length > 0) {
+                        detailHtml += `
+                            <div class="${sectionClass}">
+                                <h3 class="${sectionTitleClass}">Status Updates (Timeline by Status Tracker Agent)</h3>
+                                <ul class="space-y-3">
+                        `;
+                        const sortedStatusLog = [...callOff.statusLog].sort((a, b) => (getNestedValue(a, 'timestamp.toMillis', 0)) - (getNestedValue(b, 'timestamp.toMillis', 0)));
+                        sortedStatusLog.forEach((log) => {
+                            detailHtml += `
+                                <li class="flex items-start text-sm bg-gray-50 p-3 rounded-md shadow-sm border border-gray-200">
+                                    <span class="font-semibold text-gray-800 mr-3 min-w-[160px]">
+                                        ${formatTimestamp(getNestedValue(log, 'timestamp'))}:
+                                    </span>
+                                    <span class="text-gray-900 flex-grow">${escapeHTML(log.update || 'No update description.')}</span>
+                                    ${log.agent ? `<span class="ml-3 text-blue-600 text-xs font-medium">(${escapeHTML(log.agent)})</span>` : ''}
+                                </li>
+                            `;
+                        });
+                        detailHtml += `
+                                </ul>
+                            </div>
+                        `;
+                    }
+
+                    // Exception Handling Agent
+                    if (callOff.exceptions && callOff.exceptions.length > 0) {
+                        detailHtml += `
+                            <div class="${sectionClass} border-red-400 bg-red-50">
+                                <h3 class="${sectionTitleClass} text-red-700 border-red-300">Exceptions (by Exception Handling Agent)</h3>
+                                <div class="space-y-4">
+                        `;
+                        callOff.exceptions.forEach((exception) => {
+                            detailHtml += `
+                                <div class="border border-red-300 p-4 rounded-md bg-red-100 text-red-800 shadow-sm">
+                                    <p class="font-bold text-lg mb-1">Type: ${escapeHTML(exception.type || 'N/A')}</p>
+                                    <p class="text-md">Root Cause: ${escapeHTML(exception.rootCause || 'N/A')}</p>
+                                    <p class="text-md">Suggested Action: ${escapeHTML(exception.suggestedAction || 'N/A')}</p>
+                                    <p class="text-md">Escalated to Human: ${exception.escalated ? 'Yes' : 'No'}</p>
+                                    ${getNestedValue(exception, 'resolvedAt') ? `<p class="text-md">Resolved At: ${formatTimestamp(getNestedValue(exception, 'resolvedAt'))}</p>` : ''}
+                                    ${getNestedValue(exception, 'resolvedBy') ? `<p class="text-md">Resolved By: ${escapeHTML(getNestedValue(exception, 'resolvedBy'))}</p>` : ''}
+                                    <p class="text-xs text-red-600 mt-2">Time: ${formatTimestamp(getNestedValue(exception, 'timestamp'))}</p>
+                                </div>
+                            `;
+                        });
+                        detailHtml += `
+                                </div>
+                            </div>
+                        `;
+                    }
+
+                    // Documentation Agent
+                    if (callOff.documents && callOff.documents.length > 0) {
+                        detailHtml += `
+                            <div class="${sectionClass}">
+                                <h3 class="${sectionTitleClass}">Documents (by Documentation Agent)</h3>
+                                <p class="mb-4 text-lg text-gray-700">
+                                    <strong>Documentation Checklist:</strong> ${getNestedValue(callOff, 'documentationChecklistStatus.receivedDocs', []).length} of ${getNestedValue(callOff, 'documentationChecklistStatus.requiredDocs', []).length} documents received.
+                                </p>
+                                <ul class="space-y-3">
+                        `;
+                        callOff.documents.forEach((docItem) => {
+                            detailHtml += `
+                                <li class="flex items-center bg-gray-50 p-3 rounded-md shadow-sm border border-gray-200">
+                                    <span class="text-blue-600 text-xl mr-3">📄</span>
+                                    <div class="flex-grow">
+                                        <p class="font-semibold text-gray-800">${escapeHTML(docItem.fileName || 'N/A')} <span class="font-normal text-sm text-gray-600">(${escapeHTML(docItem.category || 'N/A')})</span></p>
+                                        ${getNestedValue(docItem, 'uploadedAt') ? `<p class="text-xs text-gray-500">Uploaded: ${formatTimestamp(getNestedValue(docItem, 'uploadedAt'))}</p>` : ''}
+                                    </div>
+                                    ${docItem.externalLink ? `
+                                        <a href="${escapeHTML(docItem.externalLink)}" target="_blank" rel="noopener noreferrer" class="ml-4 px-3 py-1 bg-blue-500 text-white rounded-md hover:bg-blue-600 transition-colors duration-200 text-sm">View Document</a>
+                                    ` : ''}
+                                </li>
+                            `;
+                        });
+                        detailHtml += `
+                                </ul>
+                            </div>
+                        `;
+                    }
+
+                    // Audit Trail & Completion
+                    detailHtml += `
+                        <div class="${sectionClass}">
+                            <h3 class="${sectionTitleClass}">Audit Trail & Completion</h3>
+                    `;
+                    if (callOff.auditTrail && callOff.auditTrail.length > 0) {
+                        detailHtml += `
+                                <div class="mb-6">
+                                    <h4 class="text-xl font-semibold text-gray-700 mb-3">Agent Decision Log:</h4>
+                                    <ul class="space-y-2 text-sm text-gray-700 bg-gray-50 p-4 rounded-md border border-gray-200">
+                        `;
+                        const sortedAuditTrail = [...callOff.auditTrail].sort((a, b) => (getNestedValue(a, 'timestamp.toMillis', 0)) - (getNestedValue(b, 'timestamp.toMillis', 0)));
+                        sortedAuditTrail.forEach((entry) => {
+                            detailHtml += `
+                                <li class="border-b border-gray-100 pb-2 last:border-b-0">
+                                    <span class="font-semibold mr-1">[${formatTimestamp(getNestedValue(entry, 'timestamp'))}]</span>
+                                    <span class="font-bold text-blue-700">${escapeHTML(entry.agent || 'Unknown Agent')}:</span> ${escapeHTML(entry.action || 'No action specified.')} - ${escapeHTML(entry.decisionDetails || 'No details provided.')}
+                                </li>
+                            `;
+                        });
+                        detailHtml += `
+                                    </ul>
+                                </div>
+                        `;
+                    }
+
+                    if (callOff.currentStatus === 'Completed') {
+                        detailHtml += `
+                            <div class="border border-green-500 bg-green-50 p-6 rounded-md text-green-800 text-center text-xl font-bold shadow-md">
+                                🎉 Call-Off Successfully Completed on ${formatDate(getNestedValue(callOff, 'completedAt'))} 🎉
+                                <p class="text-sm mt-2 font-normal">Full audit trail stored for reporting and compliance.</p>
+                            </div>
+                        `;
+                    }
+                    if (callOff.archiveStatus) {
+                        detailHtml += `<p class="text-gray-600 text-center mt-4">This call-off has been archived.</p>`;
+                    }
+                    detailHtml += `</div>`; // Close space-y-6 div
+                    detailContentDiv.innerHTML = detailHtml;
+
+                } else {
+                    detailContentDiv.innerHTML = `<div class="text-center p-8 text-red-600">No such call-off found!</div>`;
+                }
+            } catch (err) {
+                console.error("Error fetching call-off details:", err);
+                detailContentDiv.innerHTML = `<div class="text-center p-8 text-red-600">Failed to load call-off details. Please try again.<p class="text-sm text-gray-600 mt-2">${escapeHTML(err.message)}</p></div>`;
+            }
+        };
+
+        // Make navigateTo available globally for onclick attributes
+        window.navigateTo = navigateTo;
+
+        // Start rendering the correct view once Firebase is ready
+        // This initial call will be handled by the onAuthStateChanged listener
+        // that calls renderDashboard after authentication.
+        // We also attach an event listener to hashchange for direct URL navigation.
+
+    </script>
+
+    <!-- Header -->
+    <header class="bg-white shadow-md p-4 flex justify-between items-center rounded-b-lg">
+        <a href="#" onclick="navigateTo('')" class="text-3xl font-extrabold text-blue-700 hover:text-blue-800 transition-colors duration-200">
+            Logistics Flow Manager
+        </a>
+        <div class="text-gray-600 text-sm">
+            User ID: <span id="user-id-display" class="font-semibold text-blue-600">Loading...</span>
+        </div>
+    </header>
+
+    <!-- Main Content Area -->
+    <main class="container mx-auto p-6 flex-grow">
+        <!-- App Status/Loading Indicator -->
+        <div id="app-status" class="min-h-screen flex items-center justify-center bg-gray-100">
+            <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500"></div>
+            <p class="ml-4 text-lg text-gray-700">Connecting to Logistics System...</p>
+        </div>
+
+        <!-- Dashboard View -->
+        <div id="dashboard-view" class="bg-white p-8 rounded-xl shadow-lg border border-gray-200 hidden">
+            <h2 class="text-3xl font-bold mb-8 text-gray-800">All Call-Off Requests</h2>
+            <div id="call-offs-list">
+                <!-- Call-off list will be rendered here by JavaScript -->
+            </div>
+        </div>
+
+        <!-- Call-Off Detail View -->
+        <div id="detail-view" class="hidden">
+            <div id="detail-content">
+                <!-- Call-off details will be rendered here by JavaScript -->
+            </div>
+        </div>
+    </main>
+
+    <!-- Footer -->
+    <footer class="bg-gray-800 text-white text-center p-4 text-sm rounded-t-lg mt-8">
+        © <span id="current-year"></span> Logistics Flow Manager. All rights reserved.
+    </footer>
+
+    <script>
+        // Set current year in footer
+        document.getElementById('current-year').textContent = new Date().getFullYear();
+    </script>
+</body>
+</html>
